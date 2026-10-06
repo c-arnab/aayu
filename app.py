@@ -1,7 +1,5 @@
 import streamlit as st
-import requests
 import json
-import os
 
 # ──────────────────────────────────────────────
 # CONFIG
@@ -60,11 +58,6 @@ METABOLIC_QUESTIONS = [
     "Does person {id} have complete lab data?",
 ]
 
-CROSS_COHORT_QUESTIONS = [
-    "How is sleep for person {id}?",
-    "What is the HbA1c for person {id}?",
-]
-
 GENERAL_QUESTIONS = [
     "How many subjects have critical sleep debt?",
     "Which patients are getting worse?",
@@ -75,83 +68,73 @@ GENERAL_QUESTIONS = [
 
 
 # ──────────────────────────────────────────────
-# SNOWFLAKE AUTH + AGENT CALL
+# SNOWFLAKE CONNECTION + AGENT CALL
 # ──────────────────────────────────────────────
-def get_snowflake_token():
-    """Get a session token from Snowflake using key-pair or password auth."""
-    if "sf_token" in st.session_state and st.session_state.sf_token:
-        return st.session_state.sf_token
+def get_connection():
+    """Get or create a Snowflake connection."""
+    if "sf_conn" in st.session_state and st.session_state.sf_conn:
+        try:
+            st.session_state.sf_conn.cursor().execute("SELECT 1")
+            return st.session_state.sf_conn
+        except Exception:
+            st.session_state.sf_conn = None
 
-    try:
-        import snowflake.connector
-        conn_params = {
-            "account": st.secrets["snowflake"]["account"],
-            "user": st.secrets["snowflake"]["user"],
-            "warehouse": st.secrets["snowflake"]["warehouse"],
-            "database": "WELLNESS_AI",
-            "schema": "DEMO_SEMANTIC",
-            "role": st.secrets["snowflake"].get("role", "ACCOUNTADMIN"),
-        }
-        if "private_key_path" in st.secrets["snowflake"]:
-            from cryptography.hazmat.backends import default_backend
-            from cryptography.hazmat.primitives import serialization
-            with open(st.secrets["snowflake"]["private_key_path"], "rb") as f:
-                p_key = serialization.load_pem_private_key(
-                    f.read(),
-                    password=st.secrets["snowflake"].get("private_key_passphrase", "").encode()
-                        if st.secrets["snowflake"].get("private_key_passphrase") else None,
-                    backend=default_backend(),
-                )
-            conn_params["private_key"] = p_key
-        else:
-            conn_params["password"] = st.secrets["snowflake"]["password"]
+    import snowflake.connector
+    conn_params = {
+        "account": st.secrets["snowflake"]["account"],
+        "user": st.secrets["snowflake"]["user"],
+        "warehouse": st.secrets["snowflake"]["warehouse"],
+        "database": "WELLNESS_AI",
+        "schema": "DEMO_SEMANTIC",
+        "role": st.secrets["snowflake"].get("role", "ACCOUNTADMIN"),
+    }
 
-        conn = snowflake.connector.connect(**conn_params)
-        token = conn.rest.token
-        st.session_state.sf_token = token
-        st.session_state.sf_master_token = conn.rest.master_token
-        st.session_state.sf_conn = conn
-        return token
-    except Exception as e:
-        st.error(f"Authentication failed: {e}")
-        return None
+    if "private_key_path" in st.secrets["snowflake"]:
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import serialization
+        with open(st.secrets["snowflake"]["private_key_path"], "rb") as f:
+            p_key = serialization.load_pem_private_key(
+                f.read(),
+                password=(
+                    st.secrets["snowflake"]["private_key_passphrase"].encode()
+                    if st.secrets["snowflake"].get("private_key_passphrase")
+                    else None
+                ),
+                backend=default_backend(),
+            )
+        conn_params["private_key"] = p_key
+    else:
+        conn_params["password"] = st.secrets["snowflake"]["password"]
+
+    conn = snowflake.connector.connect(**conn_params)
+    st.session_state.sf_conn = conn
+    return conn
 
 
 def call_agent(question: str) -> str:
-    """Call the Cortex Agent via the DATA_AGENT_RUN SQL function."""
+    """Call the agent via SNOWFLAKE.CORTEX.DATA_AGENT_RUN with proper JSON request body."""
     try:
-        conn = st.session_state.get("sf_conn")
-        if conn is None:
-            import snowflake.connector
-            conn_params = {
-                "account": st.secrets["snowflake"]["account"],
-                "user": st.secrets["snowflake"]["user"],
-                "warehouse": st.secrets["snowflake"]["warehouse"],
-                "database": "WELLNESS_AI",
-                "schema": "DEMO_SEMANTIC",
-                "role": st.secrets["snowflake"].get("role", "ACCOUNTADMIN"),
-            }
-            if "private_key_path" in st.secrets["snowflake"]:
-                from cryptography.hazmat.backends import default_backend
-                from cryptography.hazmat.primitives import serialization
-                with open(st.secrets["snowflake"]["private_key_path"], "rb") as f:
-                    p_key = serialization.load_pem_private_key(
-                        f.read(),
-                        password=st.secrets["snowflake"].get("private_key_passphrase", "").encode()
-                            if st.secrets["snowflake"].get("private_key_passphrase") else None,
-                        backend=default_backend(),
-                    )
-                conn_params["private_key"] = p_key
-            else:
-                conn_params["password"] = st.secrets["snowflake"]["password"]
-            conn = snowflake.connector.connect(**conn_params)
-            st.session_state.sf_conn = conn
+        conn = get_connection()
 
-        escaped = question.replace("'", "''")
+        # Build the JSON request body per the DATA_AGENT_RUN spec:
+        # https://docs.snowflake.com/en/sql-reference/functions/data_agent_run-snowflake-cortex
+        request_body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": question}
+                    ]
+                }
+            ],
+            "stream": False,
+        }
+        request_json = json.dumps(request_body)
+
         sql = f"""
         SELECT SNOWFLAKE.CORTEX.DATA_AGENT_RUN(
             '{AGENT_FQN}',
-            '{escaped}'
+            $${request_json}$$
         ) AS response
         """
         cur = conn.cursor()
@@ -161,21 +144,33 @@ def call_agent(question: str) -> str:
 
         if row and row[0]:
             result = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-            # Extract the text response from the agent output
+
             if isinstance(result, dict):
-                # Navigate the response structure
+                # Response format: {"role": "assistant", "content": [...], ...}
+                content = result.get("content", [])
+                if isinstance(content, list):
+                    texts = [
+                        c.get("text", "")
+                        for c in content
+                        if c.get("type") == "text" and c.get("text")
+                    ]
+                    if texts:
+                        return "\n\n".join(texts)
+
+                # Fallback: threaded response with messages array
                 messages = result.get("messages", [])
                 for msg in reversed(messages):
                     if msg.get("role") == "assistant":
-                        content = msg.get("content", "")
-                        if isinstance(content, list):
-                            texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-                            return "\n".join(texts) if texts else str(content)
-                        return str(content)
-                # Fallback: try direct text field
+                        msg_content = msg.get("content", "")
+                        if isinstance(msg_content, list):
+                            texts = [c.get("text", "") for c in msg_content if c.get("type") == "text"]
+                            return "\n\n".join(texts) if texts else str(msg_content)
+                        return str(msg_content)
+
+                # Last fallback: dump raw JSON
                 if "text" in result:
                     return result["text"]
-                return json.dumps(result, indent=2)
+                return f"```json\n{json.dumps(result, indent=2)}\n```"
             return str(result)
         return "No response from agent."
     except Exception as e:
@@ -214,63 +209,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS
 st.markdown("""
 <style>
-    /* Subject buttons */
-    .subject-btn {
-        padding: 8px 12px;
-        border-radius: 8px;
-        border: 2px solid #e0e0e0;
-        cursor: pointer;
-        text-align: center;
-        transition: all 0.2s;
-        margin: 4px;
-    }
-    .subject-btn:hover { border-color: #4a9eff; }
-    .subject-btn.selected {
-        border-color: #4a9eff;
-        background-color: #e8f4fd;
-    }
-    .wellness-btn { border-left: 4px solid #22c55e; }
-    .metabolic-btn { border-left: 4px solid #f59e0b; }
-
-    /* Chat messages */
-    .user-msg {
-        background: #e8f4fd;
-        padding: 12px 16px;
-        border-radius: 12px;
-        margin: 8px 0;
-        border-left: 4px solid #4a9eff;
-    }
-    .agent-msg {
-        background: #f0fdf4;
-        padding: 12px 16px;
-        border-radius: 12px;
-        margin: 8px 0;
-        border-left: 4px solid #22c55e;
-    }
-
-    /* Hide default streamlit footer */
     footer { visibility: hidden; }
-
-    /* Header styling */
-    .main-header {
-        text-align: center;
-        padding: 10px 0 5px 0;
-    }
-    .main-header h1 {
-        font-size: 2rem;
-        background: linear-gradient(90deg, #22c55e, #4a9eff, #f59e0b);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    .main-header p {
-        color: #6b7280;
-        font-size: 0.9rem;
-    }
-
-    /* Sidebar question buttons */
     div[data-testid="stSidebar"] .stButton > button {
         text-align: left !important;
         font-size: 0.85rem;
@@ -294,14 +235,14 @@ if "pending_question" not in st.session_state:
 
 
 # ──────────────────────────────────────────────
-# SIDEBAR — Sample Questions
+# SIDEBAR
 # ──────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### 💡 Sample Questions")
+    st.markdown("### Sample Questions")
 
     selected = st.session_state.selected_subject
     if selected is None:
-        st.info("👆 Select a subject first to see relevant questions.")
+        st.info("Select a subject first to see relevant questions.")
     else:
         subj = None
         for cohort in SUBJECTS.values():
@@ -323,50 +264,48 @@ with st.sidebar:
                     st.session_state.pending_question = q
 
     st.divider()
-    st.markdown("### 🌐 General Questions")
-    st.caption("These don't require a subject selection.")
+    st.markdown("### General Questions")
+    st.caption("No subject selection required.")
     for i, q in enumerate(GENERAL_QUESTIONS):
         if st.button(q, key=f"gq_{i}", use_container_width=True):
             st.session_state.pending_question = q
 
+    # Cross-cohort test buttons
+    if selected:
+        st.divider()
+        st.markdown("### Cross-Cohort Tests")
+        st.caption("These should trigger boundary responses.")
+        if get_subject_cohort(selected) == "wellness":
+            test_q = f"What is the HbA1c for person {selected}?"
+        else:
+            test_q = f"How is sleep for person {selected}?"
+        if st.button(test_q, key="cross_test", use_container_width=True):
+            st.session_state.pending_question = test_q
+
     st.divider()
-    if selected and get_subject_cohort(selected) == "wellness":
-        st.markdown("### 🔀 Cross-Cohort Tests")
-        st.caption("These should trigger cohort boundary responses.")
-        test_q = f"What is the HbA1c for person {selected}?"
-        if st.button(test_q, key="cross_1", use_container_width=True):
-            st.session_state.pending_question = test_q
-    elif selected and get_subject_cohort(selected) == "metabolic":
-        st.markdown("### 🔀 Cross-Cohort Tests")
-        st.caption("These should trigger cohort boundary responses.")
-        test_q = f"How is sleep for person {selected}?"
-        if st.button(test_q, key="cross_2", use_container_width=True):
-            st.session_state.pending_question = test_q
+    if st.button("Clear Chat", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
 
 
 # ──────────────────────────────────────────────
-# MAIN AREA — Header
+# MAIN — Header
 # ──────────────────────────────────────────────
-st.markdown("""
-<div class="main-header">
-    <h1>🧬 AAYU Research Project</h1>
-    <p>Proactive Wellness Intelligence — Synthetic Demo Data</p>
-</div>
-""", unsafe_allow_html=True)
+st.markdown("# 🧬 AAYU Research Project")
+st.caption("Proactive Wellness Intelligence — Synthetic Demo Data")
 
 
 # ──────────────────────────────────────────────
-# MAIN AREA — Subject Selection Grid
+# MAIN — Subject Selection
 # ──────────────────────────────────────────────
 st.markdown("#### Select a Subject")
 
-# Wellness row
 st.markdown("**🟢 Wellness Cohort** — Sleep, Activity, Recovery, Circadian")
 w_cols = st.columns(6)
 for i, subj in enumerate(SUBJECTS["wellness"]):
     with w_cols[i]:
         is_selected = st.session_state.selected_subject == subj["id"]
-        btn_label = f"{subj['icon']} {subj['label']}\n`{subj['id']}` · {subj['days']}"
+        btn_label = f"{subj['icon']} {subj['label']}\n{subj['id']} · {subj['days']}"
         if st.button(
             btn_label,
             key=f"w_{subj['id']}",
@@ -376,13 +315,12 @@ for i, subj in enumerate(SUBJECTS["wellness"]):
             st.session_state.selected_subject = subj["id"]
             st.rerun()
 
-# Metabolic row
 st.markdown("**🟡 Metabolic Cohort** — HbA1c, BMI, eGFR, Diabetes")
 m_cols = st.columns(6)
 for i, subj in enumerate(SUBJECTS["metabolic"]):
     with m_cols[i]:
         is_selected = st.session_state.selected_subject == subj["id"]
-        btn_label = f"{subj['icon']} {subj['label']}\n`{subj['id']}` · {subj['days']}"
+        btn_label = f"{subj['icon']} {subj['label']}\n{subj['id']} · {subj['days']}"
         if st.button(
             btn_label,
             key=f"m_{subj['id']}",
@@ -396,7 +334,7 @@ st.divider()
 
 
 # ──────────────────────────────────────────────
-# MAIN AREA — Chat History
+# MAIN — Chat History
 # ──────────────────────────────────────────────
 for entry in st.session_state.chat_history:
     if entry["role"] == "user":
@@ -408,19 +346,16 @@ for entry in st.session_state.chat_history:
 
 
 # ──────────────────────────────────────────────
-# MAIN AREA — Chat Input (bottom)
+# MAIN — Process pending question from sidebar
 # ──────────────────────────────────────────────
-# Process pending question from sidebar
 if st.session_state.pending_question:
     prompt = st.session_state.pending_question
     st.session_state.pending_question = None
 
-    # Add to chat
     st.session_state.chat_history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Call agent
     with st.chat_message("assistant", avatar="🧬"):
         with st.spinner("AAYU is thinking..."):
             response = call_agent(prompt)
@@ -428,7 +363,10 @@ if st.session_state.pending_question:
     st.session_state.chat_history.append({"role": "assistant", "content": response})
     st.rerun()
 
-# Manual input
+
+# ──────────────────────────────────────────────
+# MAIN — Chat Input (bottom prompt bar)
+# ──────────────────────────────────────────────
 if prompt := st.chat_input("Ask AAYU about a subject's health..."):
     st.session_state.chat_history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
