@@ -3,4 +3,4 @@ app.py
 requirements.txt
 
 Complete Project Document
-Aayu Proactive Wellness Intel;igence platform.md
+Aayu Proactive Wellness Intelligence platform.md
